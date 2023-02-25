@@ -1,0 +1,396 @@
+//#include <Arduino.h>
+/*
+ * Tiny4kOLED - Drivers for SSD1306 controlled dot matrix OLED/PLED 128x32 displays
+ *
+ * Based on ssd1306xled, re-written and extended by Stephen Denne
+ * from 2017-04-25 at https://github.com/datacute/Tiny4kOLED
+ *
+ * This example shows a full screen rectangle,
+ * writes the rectangle size inside the rectangle,
+ * and scrolls the size off the screen.
+ *
+ */
+
+// #define WOKWI
+
+#ifdef WOKWI
+#include "TinyWireM.h"
+#include "Tiny4kOLED.h"
+#include "KickMath.h"
+#include <EEPROM.h>
+#define ANALOG_METER
+#else
+#include <avr/io.h>
+#include "TinyWireM.h"
+#include "Tiny4kOLED.h"
+#include "math.h"
+#include <EEPROM.h>
+#include "Adafruit_VEML7700.h"
+#endif
+
+//#define ANALOG_METER
+
+#define ALS_GAIN 11
+#define ALS_IT 6
+#define ALS_PERS 4
+
+#define VEML_GAIN VEML7700_GAIN_2
+#define VEML_IT VEML7700_IT_100MS
+#define VEML_PERS VEML7700_PERS_1
+
+
+
+#define WIDTH 128
+#define HEIGHT 32
+
+#define RIGHT_BTN_PIN PINB4
+#define DOWN_BTN_PIN PINB1
+#define BATT_PIN PINB
+
+#define BOOL_OPTIONS_BYTE_ADDRESS 0
+#define SHIFT_CALC_FOR_APERTURE 0
+#define SHIFT_INCIDENT_METER 1
+
+#define ISO_INDEX_ADDRESS 1
+#define APERTURE_INDEX_ADDRESS 2
+#define SHUTTER_INDEX_ADDRESS 3
+
+#define ISO_ROW 0
+#define SHUTTER_ROW 1
+#define APERTURE_ROW 2
+#define INCIDENT_METER_ROW 3
+#define CALC_FOR_APERTURE_ROW 4
+#define LUX_ROW 5
+#define ILLUMINANCE_ROW 6
+
+#define CONSTANT_K 12
+#define CONSTANT_C 320
+#define TOTAL_ROWS 5
+
+#define ISO_INDEX_LIMIT 6
+#define APERTURE_INDEX_LIMIT 12
+#define SHUTTER_INDEX_LIMIT 4
+
+#define LEFT_MARGIN 2
+
+
+const float GAMMA = 0.7;
+const float RL10 = 50;
+
+bool int_right=0;
+bool int_down=0;
+bool old_right=0;
+bool old_down=0;
+uint8_t row_index=0;
+uint8_t readLight=0;
+
+uint16_t iso_values[] = {100,
+                        200,
+                        400,500,
+                        800,
+                        1600};
+
+float aperture_values[] = {2.8,3.3,
+                            4,4.8,
+                            5.6,6.7,
+                            8,9.5,
+                            11,13,
+                            16,
+                            22};
+
+uint16_t shutter_values[] = {30,60,125,175};
+
+String meter_mode_options[] = {"REFL","INCID"};
+uint16_t meter_constant_options[] = {CONSTANT_K, CONSTANT_C};
+float lux_lum_correction_options[] = {12.57, 1};
+
+String calc_for_options[] = {"SHUTTER","APERT"};
+
+
+
+void increaseMemoryByte(char address, uint8_t limit) {
+  // EEPROM[address]++;  
+  uint8_t byte = EEPROM.read(address);
+  byte++;
+  EEPROM.write(address, byte%limit);
+}
+
+void decreaseMemoryByte(char address, uint8_t limit) {
+  // EEPROM[address]--;
+  int8_t byte = EEPROM.read(address);
+  byte--;
+  EEPROM.write(address, byte%limit);
+}
+
+void setMemoryByte(char address, uint8_t value) {
+  EEPROM.update(address, value);
+}
+
+void flipMemoryBit(char address, uint8_t bit) {
+  uint8_t byte = EEPROM.read(address);
+  byte ^= (1 << bit);
+  EEPROM.update(address, byte);
+}
+void nextRow(){
+  row_index++;
+  row_index=row_index%TOTAL_ROWS;
+}
+void increaseSettingIndex(){
+  switch (row_index) {
+    case ISO_ROW:
+      increaseMemoryByte(ISO_INDEX_ADDRESS, ISO_INDEX_LIMIT);
+      break;
+    case SHUTTER_ROW:
+      increaseMemoryByte(SHUTTER_INDEX_ADDRESS, SHUTTER_INDEX_LIMIT);
+      break;
+    case APERTURE_ROW:
+      increaseMemoryByte(APERTURE_INDEX_ADDRESS, APERTURE_INDEX_LIMIT);
+      break;
+    case INCIDENT_METER_ROW:
+      flipMemoryBit(BOOL_OPTIONS_BYTE_ADDRESS, SHIFT_INCIDENT_METER);
+      break;
+    case CALC_FOR_APERTURE_ROW:
+      flipMemoryBit(BOOL_OPTIONS_BYTE_ADDRESS, SHIFT_CALC_FOR_APERTURE);
+      break;
+  }
+}
+
+
+#ifdef ANALOG_METER
+uint8_t read_analog_light() {
+  PRR &= ~(1<<PRADC);        //power up adc
+  ADCSRA |= (1 << ADEN);   //enables the ADC
+
+  ADCSRA |= (1 << ADSC);   //start conversion
+  while (ADCSRA & (1<<ADSC));
+  // readLight = ADCH;
+
+  ADCSRA &= ~(1 << ADEN);   //disables the ADC
+  PRR |= (1<<PRADC);        //powerdown adc
+
+  return ADCH;   //return data
+}
+float get_lux() {
+  // Convert the analog value into lux value:
+  uint8_t analogValue = ADCH;//read_analog_light();
+  float voltage = analogValue / 256. * 5; //use 1024 instead of 256 for 10 bit resolution
+  float resistance = 2000 * voltage / (1 - voltage / 5);
+  float lux = pow(RL10 * 1e3 * pow(10, GAMMA) / resistance, (1 / GAMMA));
+  return lux;
+}
+#else
+void Init_Veml(){ // Setup the veml7700 for one-shot mode
+  TinyWireM.begin();
+  TinyWireM.beginTransmission(VEML7700_I2CADDR_DEFAULT);
+  TinyWireM.send(VEML7700_ALS_CONFIG);                 // Access Command Register
+
+  TinyWireM.send((VEML_GAIN<<ALS_GAIN) | (VEML_IT<<ALS_IT) | (VEML_PERS<<ALS_PERS));            // Using one-shot mode for battery savings
+  //TinyWireM.send(B00000000);          // if setting continious mode for fast reads
+  TinyWireM.endTransmission();          // Send to the slave
+}
+
+
+float get_lux(){  // Get the temperature from a DS1621
+  float scaler =0.0576;
+  #if VEML_GAIN == VEML7700_GAIN_2
+    scaler/=2;
+  #elif VEML_GAIN == VEML7700_GAIN_1_4
+    scaler*=4;
+  #elif VEML_GAIN == VEML7700_GAIN_1_8
+    scaler*=8;
+  #endif
+  #if VEML_IT == VEML7700_IT_25MS
+    scaler*=4;
+  #elif VEML_IT == VEML7700_IT_50MS
+    scaler*=2;
+  #elif VEML_IT == VEML7700_IT_200MS
+    scaler/=2;
+  #elif VEML_IT == VEML7700_IT_400MS
+    scaler/=4;
+  #elif VEML_IT == VEML7700_IT_800MS
+    scaler/=8;
+  #endif
+
+  TinyWireM.beginTransmission(VEML7700_I2CADDR_DEFAULT);
+  TinyWireM.send(VEML7700_WHITE_DATA);                 // read temperature (for either mode)
+  TinyWireM.endTransmission();          // Send 1 byte to the slave
+  TinyWireM.requestFrom(VEML7700_I2CADDR_DEFAULT,2); // Request 1 byte from slave
+
+  uint16_t rawLSB = TinyWireM.receive();
+  uint16_t rawMSB = TinyWireM.receive();
+  return float((rawMSB<<8)|rawLSB)*scaler;
+}
+
+
+#endif
+
+
+
+
+float calc_aperture(float light, uint16_t constant) {
+  return sqrt(1./shutter_values[EEPROM[SHUTTER_INDEX_ADDRESS]]*light*iso_values[EEPROM[ISO_INDEX_ADDRESS]]/constant);
+}
+
+float calc_shutter(float light, uint16_t constant) {
+  return 1/((pow(aperture_values[EEPROM[APERTURE_INDEX_ADDRESS]],2))*constant/(light*iso_values[EEPROM[ISO_INDEX_ADDRESS]]));
+}
+
+void drawScreen() {
+  
+  oled.setCursor(0, 0);
+  oled.startData();
+  oled.sendData(0b11111111);
+  oled.repeatData(0b00000001, WIDTH - 2);
+  oled.sendData(0b11111111);
+  oled.endData();
+
+  for (uint8_t y = 1; y < (HEIGHT - 8) / 8; y++) {
+    oled.setCursor(0, y);
+    oled.startData();
+    oled.sendData(0b11111111);
+    oled.repeatData(0b00000000, WIDTH - 2);
+    oled.sendData(0b11111111);
+    oled.endData();
+  }
+
+  oled.setCursor(0, (HEIGHT - 8) / 8);
+  oled.startData();
+  oled.sendData(0b11111111);
+  oled.repeatData(0b10000000, WIDTH - 2);
+  oled.sendData(0b11111111);
+  oled.endData();
+
+}
+
+
+void update_cursor() {
+  oled.setCursor(100, row_index);
+  // oled.print(row_index);
+  oled.print("<");
+}
+
+
+
+void update_measurements() {
+  bool incident_metering = (EEPROM[BOOL_OPTIONS_BYTE_ADDRESS]>>SHIFT_INCIDENT_METER)&1;
+
+  float light = get_lux()/lux_lum_correction_options[incident_metering];
+  float constant = meter_constant_options[incident_metering];
+
+  //oled.clear(); 
+
+  bool do_aperture = (EEPROM[BOOL_OPTIONS_BYTE_ADDRESS]>>SHIFT_CALC_FOR_APERTURE)&1;
+
+
+  oled.setCursor(LEFT_MARGIN, ISO_ROW);
+  oled.print("ISO ");
+  oled.print(iso_values[EEPROM[ISO_INDEX_ADDRESS]]);
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, SHUTTER_ROW);
+  oled.print("1/S ");
+  oled.print((!do_aperture) ? 1/((pow(aperture_values[EEPROM[APERTURE_INDEX_ADDRESS]],2))*float(constant)/(light*iso_values[EEPROM[ISO_INDEX_ADDRESS]])) : shutter_values[EEPROM[SHUTTER_INDEX_ADDRESS]]);
+  // oled.print((!do_aperture) ? int(calc_shutter(light, constant)) : shutter_values[EEPROM[SHUTTER_INDEX_ADDRESS]]);
+  oled.print((!do_aperture) ? " <--" : "");
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, APERTURE_ROW);
+  oled.print("F/- ");
+  oled.print((do_aperture) ? sqrt(1./shutter_values[EEPROM[SHUTTER_INDEX_ADDRESS]]*light*iso_values[EEPROM[ISO_INDEX_ADDRESS]]/constant) : aperture_values[EEPROM[APERTURE_INDEX_ADDRESS]]);
+  // oled.print((do_aperture) ? calc_aperture(light, constant) : aperture_values[EEPROM[APERTURE_INDEX_ADDRESS]]);
+  oled.print((do_aperture) ? " <--" : "");
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, LUX_ROW);
+  oled.print("LUX ");
+  oled.print(get_lux());
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, ILLUMINANCE_ROW);
+  oled.print("CD* ");
+  oled.print(get_lux()/lux_lum_correction_options[0]);
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, INCIDENT_METER_ROW);
+  oled.print("METER: ");
+  oled.print(meter_mode_options[incident_metering]);
+  oled.clearToEOL();
+
+  oled.setCursor(LEFT_MARGIN, CALC_FOR_APERTURE_ROW);
+  oled.print("CALCFOR: ");
+  oled.print(calc_for_options[do_aperture]);
+  oled.clearToEOL();
+
+}
+
+
+uint32_t int_lastDebounceTime=0;
+ISR (PCINT0_vect)        // Interrupt service routine 
+{
+  int_down=(!(PINB & (1<<PINB1)));
+  int_right=(!(PINB & (1<<PINB4)));
+  int_lastDebounceTime=millis();
+
+}
+
+void setup() {
+  #ifdef ANALOG_METER
+  ADMUX |= (1 << MUX0);   //combined with next line…
+  ADMUX |= (1 << MUX1);   //sets ADC3 as analog input channel
+  ADMUX |= (1 << ADLAR);   //Left Adjust the ADCH and ADCL registers
+
+  ADCSRA |= (1 << ADEN);   //enables the ADC
+
+  ADCSRA |= (1 << ADPS1);   //with next line…
+  ADCSRA |= (1 << ADPS0);   //set division factor-8 for 125kHz ADC clock
+
+  ACSR |= (1 << ACD);   // diable analog comparator to save power
+  #else
+  Init_Veml();
+  #endif
+
+  DDRB &= ~(1 << DDB1);  //set PB1 to input (initialized as such, so its redundant)
+  DDRB &= ~(1 << DDB4);  //set PB4 to input (initialized as such, so its redundant)
+
+  PORTB |= (1 << PORTB1);  //activate internal pull-up resistor for PB1
+  PORTB |= (1 << PORTB4);  //activate internal pull-up resistor for PB4
+
+  sei(); // enable interrupts
+  GIMSK|= (1<<PCIE); // enable pin change interrupt
+  PCMSK|=(1<<PCINT1)|(1<<PCINT4); //enable pin change interrupt for PB1 and PB4
+  MCUCR |= (1<<ISC01);    // Configuring as falling edge 
+
+  oled.begin(WIDTH, HEIGHT, sizeof(tiny4koled_init_128x32br), tiny4koled_init_128x32br);
+  oled.setFont(FONT6X8CAPS);
+  //drawScreen();
+  oled.on();
+  
+}
+
+uint16_t timer=0;
+bool last_state=0;
+void loop() {
+  bool down = int_down;
+  bool right = int_right;
+  uint32_t lastDebounceTime = int_lastDebounceTime;
+
+  if (((millis()-lastDebounceTime)>10) && last_state!=(down||right)) {
+
+    if (down) nextRow();
+    if (right) increaseSettingIndex();
+    last_state=(down||right);
+  }
+
+
+  if (timer%500==0) {
+    #ifdef ANALOG_METER
+    read_analog_light();
+    #endif
+    update_measurements();
+    update_cursor();
+  }
+  timer++;
+  //if (timer>=10000) timer=0;
+  delay(1);
+}
+

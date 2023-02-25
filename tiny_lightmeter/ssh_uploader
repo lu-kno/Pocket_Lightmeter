@@ -1,0 +1,5 @@
+#!/usr/bin/bash
+# Script to copy hex file to raspberry pi and upload to tiny
+
+scp /home/lu/source/repos/tiny_lightmeter/tiny_lightmeter/.pio/build/attiny85/firmware.hex pi@192.168.0.8:~/
+ssh pi@192.168.0.8 '~/upload_tiny'

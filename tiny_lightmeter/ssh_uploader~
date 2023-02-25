@@ -1,0 +1,3 @@
+#!/usr/bin/bash
+scp /home/lu/source/repos/tiny_lightmeter/tiny_lightmeter/.pio/build/attiny85/firmware.hex pi@192.168.0.8:~/
+ssh pi@192.168.0.8 '~/upload_tiny'
