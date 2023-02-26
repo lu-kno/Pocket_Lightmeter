@@ -8,4 +8,4 @@ Circuit Schematics and PCB design files are available in the `EAGLE` folder.
 
 # Other
 
-`esp_lightmeter` folder is a work in progress to build a lightmeter using an ESP8266 and a BH1750FVI light sensor. DEPRECATED
+`esp_lightmeter` folder is a work in progress to build a lightmeter using an ESP8266 and a BH1750FVI light sensor. STALE
